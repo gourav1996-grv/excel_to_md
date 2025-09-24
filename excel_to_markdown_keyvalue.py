@@ -3,58 +3,78 @@ from openpyxl import load_workbook
 import re
 
 
-def extract_text_blocks(sheet, max_text_row=20):
-    """
-    Extract explanatory text blocks from the top or scattered areas.
-    Scans rows until it finds a likely table header.
-    """
-    text_lines = []
-    potential_header_keywords = [
-        "NAME",
-        "DESCRIPTION",
-        "Attribute Series",
-        "Industry name",
-    ]  # Based on your screenshots
+def is_likely_header(row_values):
+    # Heuristic for header: Multiple columns (2+), short average length, no punctuation at end
+    str_values = [str(v).strip() for v in row_values if v is not None]
+    if len(str_values) < 2:
+        return False
+    avg_len = sum(len(s) for s in str_values) / len(str_values)
+    if avg_len > 25 or any(s.endswith((".", "?", "!")) for s in str_values):
+        return False
+    return True
 
-    for row_idx, row in enumerate(
-        sheet.iter_rows(min_row=1, max_row=max_text_row), start=1
-    ):
-        row_values = [cell.value for cell in row if cell.value is not None]
-        if not row_values:
-            continue  # Skip empty rows
 
-        # Check if this looks like a table header
-        if any(
-            keyword in str(val).upper()
-            for val in row_values
-            for keyword in potential_header_keywords
+def extract_sections(sheet):
+    sections = []
+    row_num = 1
+    max_row = sheet.max_row
+    while row_num <= max_row:
+        # Skip empty rows
+        while row_num <= max_row and not any(
+            cell.value for cell in sheet[row_num] if cell.value is not None
         ):
-            break  # Stop at potential table start
+            row_num += 1
+        if row_num > max_row:
+            break
 
-        # Collect text (join cells in row)
-        text_lines.append(" ".join(str(val) for val in row_values if val))
+        current_row_values = [
+            cell.value for cell in sheet[row_num] if cell.value is not None
+        ]
 
-    explanations = "\n".join(line.strip() for line in text_lines if line.strip())
-    return explanations, row_idx
+        if is_likely_header(current_row_values):
+            # Potential table start
+            table_start = row_num
+            header_row = current_row_values
+            row_num += 1
+            # Collect rows until empty or end
+            table_rows = [header_row]
+            while row_num <= max_row and any(
+                cell.value for cell in sheet[row_num] if cell.value is not None
+            ):
+                row_values = [cell.value for cell in sheet[row_num]]
+                row_values += [None] * (
+                    len(header_row) - len(row_values)
+                )  # Pad short rows
+                table_rows.append(row_values)
+                row_num += 1
+            # Create DF from collected rows
+            df = pd.DataFrame(table_rows[1:], columns=table_rows[0])
+            df = df.dropna(how="all").dropna(axis=1, how="all")
+            df = df.applymap(
+                lambda x: str(x).replace("\n", " ; ") if pd.notnull(x) else ""
+            )
+            sections.append(("table", df))
+        else:
+            # Text block
+            text_lines = []
+            while (
+                row_num <= max_row
+                and not is_likely_header(
+                    [cell.value for cell in sheet[row_num] if cell.value is not None]
+                )
+                and any(cell.value for cell in sheet[row_num] if cell.value is not None)
+            ):
+                row_values = [
+                    cell.value for cell in sheet[row_num] if cell.value is not None
+                ]
+                text_line = " ".join(str(v).strip() for v in row_values)
+                if text_line:
+                    text_lines.append(text_line)
+                row_num += 1
+            if text_lines:
+                sections.append(("text", "\n".join(text_lines)))
 
-
-def extract_table(sheet, start_row):
-    """
-    Extract the main table starting from a given row.
-    Use pandas to read from that point.
-    """
-    from io import BytesIO
-
-    temp_file = BytesIO()
-    sheet._parent.save(temp_file)
-    temp_file.seek(0)
-
-    df = pd.read_excel(
-        temp_file, sheet_name=sheet.title, header=start_row - 1, engine="openpyxl"
-    )
-    df = df.dropna(how="all").dropna(axis=1, how="all")
-    df = df.applymap(lambda x: str(x).replace("\n", " ; ") if isinstance(x, str) else x)
-    return df
+    return sections
 
 
 def convert_excel_to_markdown(file_path, output_md="data_dict_markdown.md"):
@@ -63,26 +83,26 @@ def convert_excel_to_markdown(file_path, output_md="data_dict_markdown.md"):
 
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
+        sections = extract_sections(sheet)
 
-        # Step 1: Extract text explanations and find table start
-        explanations, table_start_row = extract_text_blocks(sheet)
+        full_md = f"# Sheet: {sheet_name}\n"
+        text_count = 1
+        table_count = 1
+        for sec_type, content in sections:
+            if sec_type == "text":
+                full_md += f"## Text Section {text_count}:\n{content}\n\n"
+                text_count += 1
+            elif sec_type == "table":
+                # Convert DF to key-value format per row
+                table_kv = ""
+                for _, row in content.iterrows():
+                    for col, value in row.items():
+                        table_kv += f"{col}: {value}\n"
+                    table_kv += "\n"  # Blank line between records
+                full_md += f"## Table Section {table_count} (Key-Value Format):\n{table_kv}\n\n"
+                table_count += 1
 
-        # Step 2: Extract table and convert to key-value format
-        if table_start_row < sheet.max_row:
-            df = extract_table(sheet, table_start_row)
-            # Convert to key-value per row (screenshot format)
-            table_kv = ""
-            for _, row in df.iterrows():
-                for col, value in row.items():
-                    table_kv += f"{col}: {value}\n"
-                table_kv += "\n"  # Blank line between records
-        else:
-            table_kv = "No main table detected."
-
-        # Step 3: Combine into Markdown
-        full_md = f"# Sheet: {sheet_name}\n## Explanations and Glossary:\n{explanations}\n\n## Main Table (Key-Value Format):\n{table_kv}"
-
-        # Clean up extra newlines
+        # Clean extra newlines
         full_md = re.sub(r"\n{3,}", "\n\n", full_md)
         markdown_docs.append(full_md)
 
@@ -95,6 +115,4 @@ def convert_excel_to_markdown(file_path, output_md="data_dict_markdown.md"):
 
 # Usage
 if __name__ == "__main__":
-    convert_excel_to_markdown(
-        "dummy_data_dictionary.xlsx"
-    )  # Replace with your dummy_data_dictionary.xlsx or actual file
+    convert_excel_to_markdown("dummy_data_dictionary.xlsx")  # Replace with your file
